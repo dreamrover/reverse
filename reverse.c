@@ -16,6 +16,7 @@
 #include <linux/uaccess.h>
 #include <linux/proc_fs.h>
 #include <linux/mm.h>
+#include <linux/io.h>
 #include <linux/slab.h>
 
 struct reverse_buffer {
@@ -24,6 +25,7 @@ struct reverse_buffer {
     char *read_ptr;
     unsigned long size;
     wait_queue_head_t read_queue;
+    struct fasync_struct *async_queue;
 };
 
 static unsigned long buffer_size = PAGE_SIZE;
@@ -74,11 +76,6 @@ static int reverse_open(struct inode *inode, struct file *filp)
     return err;
 }
 
-static int reverse_release(struct inode *inode, struct file *filp)
-{
-    return reverse_buffer_free(filp->private_data);
-}
-
 static ssize_t reverse_read(struct file *filp, char __user *out, size_t size, loff_t *off)
 {
     struct reverse_buffer *buf = filp->private_data;
@@ -109,6 +106,58 @@ out:
     return result;
 }
 
+void reverse_vma_open(struct vm_area_struct *vma)
+{
+    printk(KERN_NOTICE "reverse_vma_open, virt %lx, phys %lx, PAGE_SHIFT %d\n", vma->vm_start, vma->vm_pgoff << PAGE_SHIFT, PAGE_SHIFT);
+}
+
+void reverse_vma_close(struct vm_area_struct *vma)
+{
+    printk(KERN_NOTICE "reverse_vma_close\n");
+}
+
+static struct vm_operations_struct reverse_remap_vm_ops = {
+    .open = reverse_vma_open,
+    .close = reverse_vma_close,
+};
+
+#define REVERSE_IOC_MAGIC 'R'
+#define REVERSE_GET_ADDR _IOR(REVERSE_IOC_MAGIC, 1, int)
+
+static int reverse_ioctl(struct inode *inode, struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    int retval;
+
+    switch(cmd)
+    {
+        case REVERSE_GET_ADDR:
+            __put_user(page, (int __user *)arg);
+            retval = page;
+            printk(KERN_NOTICE "retval: %x, arg: %p\n", retval, *(unsigned long *)arg);
+            break;
+        default:
+            return -ENOTTY;
+    }
+    return retval;
+}
+
+static int reverse_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    struct reverse_buffer *buf = filp->private_data;
+    int ret;
+
+    vma->vm_flags |= VM_IO;
+    //vma->vm_flags |= VM_RESERVED;
+    //ret = remap_pfn_range(vma, vma->vmstart, vm->vm_pg_off, vma->vm_end - vma->vm_start, vma->vm_page_prot);
+    //ret = remap_pfn_range(vma, vma->vm_start, virt_to_phys(buf->data)>>PAGE_SHIFT, vma->vm_end - vma->vm_start, vma->vm_page_prot);
+    ret = remap_pfn_range(vma, vma->vm_start, virt_to_phys(page)>>PAGE_SHIFT, vma->vm_end - vma->vm_start, vma->vm_page_prot);
+    if (ret)
+        return -EAGAIN;
+    vma->vm_ops = &reverse_remap_vm_ops;
+    reverse_vma_open(vma);
+    return 0;
+}
+
 static void reverse_phrase(char *head, char *tail)
 {
     while (head < tail)
@@ -123,6 +172,7 @@ static ssize_t reverse_write(struct file *filp, const char __user *in, size_t si
 {
     struct reverse_buffer *buf = filp->private_data;
     ssize_t result;
+    static int cnt = 0;
 
     if (size > buffer_size)
     {
@@ -151,8 +201,32 @@ static ssize_t reverse_write(struct file *filp, const char __user *in, size_t si
     memset(page, 0, buffer_size);
     memcpy(page, buf->data, size);
     wake_up_interruptible(&buf->read_queue);
+
+    if (buf->async_queue)
+    {
+        if (cnt==0)
+            kill_fasync(&buf->async_queue, SIGIO, POLL_IN);
+        else if (cnt==1)
+            kill_fasync(&buf->async_queue, SIGIO, POLL_OUT);
+        else
+            kill_fasync(&buf->async_queue, SIGUSR1, POLL_IN);
+        cnt = (cnt + 1) % 3;
+    }
 out:
     return result;
+}
+
+static int reverse_fasync(int fd, struct file *filp, int mode)
+{
+    struct reverse_buffer *buf = filp->private_data;
+
+    return fasync_helper(fd, filp, mode, &buf->async_queue);
+}
+
+static int reverse_release(struct inode *inode, struct file *filp)
+{
+    reverse_fasync(-1, filp, 0);
+    return reverse_buffer_free(filp->private_data);
 }
 
 static struct file_operations reverse_fops = {
@@ -161,7 +235,10 @@ static struct file_operations reverse_fops = {
     .read = reverse_read,
     .write = reverse_write,
     .open = reverse_open,
-    .release = reverse_release
+    .release = reverse_release,
+    .mmap = reverse_mmap,
+    .fasync = reverse_fasync,
+    .ioctl = reverse_ioctl,
 };
 
 static struct miscdevice reverse_misc_device = {
@@ -262,3 +339,4 @@ module_exit(reverse_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Reverse");
 MODULE_AUTHOR("Anonymous");
+
